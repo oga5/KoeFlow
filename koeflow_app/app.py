@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -29,7 +30,11 @@ class VoiceInputApp:
             switch_model_hotkey=self.config.switch_model_hotkey,
             clear_buffer_hotkey=self.config.clear_buffer_hotkey,
         )
-        self.recorder = AudioCapture(sample_rate=self.config.sample_rate, channels=self.config.channels)
+        self.recorder = AudioCapture(
+            sample_rate=self.config.sample_rate,
+            channels=self.config.channels,
+            chunk_seconds=self.config.audio_chunk_seconds,
+        )
         self._model_presets = self.config.model_presets
         self._active_model_index = 0
         initial_primary_model_id, initial_backend = self._resolve_transcriber_preset(
@@ -48,8 +53,14 @@ class VoiceInputApp:
         self._text_lock = threading.Lock()
         self._current_text = ""
         self._last_model_label = ""
+        self._session_audio_chunks: list[np.ndarray] = []
+        self._dropped_stt_chunks = 0
+        self._stt_stats_counter = 0
         self._buffer_generation = 0
-        self._stt_input_queue: "queue.Queue[tuple[int, np.ndarray]]" = queue.Queue()
+        queue_maxsize = int(self.config.stt_input_queue_max)
+        self._stt_input_queue: "queue.Queue[tuple[int, np.ndarray]]" = (
+            queue.Queue() if queue_maxsize <= 0 else queue.Queue(maxsize=queue_maxsize)
+        )
         self._stt_output_queue: "queue.Queue[tuple[int, str]]" = queue.Queue()
         self._stop_worker = threading.Event()
         self._worker = threading.Thread(target=self._stt_worker, daemon=True)
@@ -90,12 +101,14 @@ class VoiceInputApp:
             self._stop_recording()
 
     def _start_recording(self) -> None:
+        self._session_audio_chunks = []
         self.recorder.start()
         self._recording = True
         self.ui.set_status("録音中...")
 
     def _stop_recording(self) -> None:
         self.recorder.stop()
+        self._collect_pending_audio_chunks()
         self._recording = False
         self.ui.set_status("待機中")
 
@@ -132,7 +145,25 @@ class VoiceInputApp:
             if chunk is None:
                 break
             if chunk.size > 0:
-                self._stt_input_queue.put((generation, chunk))
+                self._session_audio_chunks.append(chunk)
+                self._enqueue_stt_chunk(generation, chunk)
+
+    def _collect_pending_audio_chunks(self) -> None:
+        while True:
+            chunk = self.recorder.pop_chunk_nowait()
+            if chunk is None:
+                break
+            if chunk.size > 0:
+                self._session_audio_chunks.append(chunk)
+
+    def _enqueue_stt_chunk(self, generation: int, chunk: np.ndarray) -> None:
+        if self._stt_input_queue.full():
+            self._dropped_stt_chunks += 1
+            return
+        try:
+            self._stt_input_queue.put_nowait((generation, chunk))
+        except queue.Full:
+            self._dropped_stt_chunks += 1
 
     def _stt_worker(self) -> None:
         while not self._stop_worker.is_set():
@@ -141,7 +172,29 @@ class VoiceInputApp:
             except queue.Empty:
                 continue
             try:
-                text = self.transcriber.transcribe(chunk, self.config.sample_rate)
+                with self._text_lock:
+                    prompt_tail = self._current_text[-self.config.realtime_context_chars :].strip()
+                started_at = time.perf_counter()
+                text = self.transcriber.transcribe(
+                    chunk,
+                    self.config.sample_rate,
+                    prompt_text=prompt_tail,
+                    final_pass=False,
+                )
+                elapsed = time.perf_counter() - started_at
+                chunk_seconds = float(chunk.size) / float(self.config.sample_rate)
+                rtf = elapsed / chunk_seconds if chunk_seconds > 0 else 0.0
+                self._stt_stats_counter += 1
+                if self._stt_stats_counter % 10 == 0:
+                    LOGGER.info(
+                        "STT stats: chunk=%.2fs infer=%.0fms rtf=%.2f q_in=%d q_out=%d dropped=%d",
+                        chunk_seconds,
+                        elapsed * 1000.0,
+                        rtf,
+                        self._stt_input_queue.qsize(),
+                        self._stt_output_queue.qsize(),
+                        self._dropped_stt_chunks,
+                    )
                 if text:
                     self._stt_output_queue.put((generation, text))
             except Exception as exc:  # noqa: BLE001
@@ -169,6 +222,13 @@ class VoiceInputApp:
         if self._recording:
             self._stop_recording()
 
+        if self.config.enable_finalize_pass:
+            finalized = self._run_finalize_pass()
+            if finalized:
+                with self._text_lock:
+                    self._current_text = finalized
+                self.ui.set_text(finalized)
+
         with self._text_lock:
             text = self._current_text.strip()
 
@@ -179,8 +239,35 @@ class VoiceInputApp:
 
         with self._text_lock:
             self._current_text = ""
+        self._session_audio_chunks = []
         self.ui.set_text("")
         self.ui.set_status("貼り付け完了")
+
+    def _run_finalize_pass(self) -> str:
+        if not self._session_audio_chunks:
+            return ""
+        merged_audio = np.concatenate(self._session_audio_chunks)
+        started_at = time.perf_counter()
+        try:
+            finalized = self.transcriber.transcribe(
+                merged_audio,
+                self.config.sample_rate,
+                prompt_text="",
+                final_pass=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Finalize pass failed: %s", exc)
+            return ""
+        elapsed = time.perf_counter() - started_at
+        audio_seconds = float(merged_audio.size) / float(self.config.sample_rate)
+        rtf = elapsed / audio_seconds if audio_seconds > 0 else 0.0
+        LOGGER.info(
+            "Finalize pass: audio=%.2fs infer=%.0fms rtf=%.2f",
+            audio_seconds,
+            elapsed * 1000.0,
+            rtf,
+        )
+        return finalized.strip()
 
     def switch_model(self) -> None:
         if len(self._model_presets) <= 1:
@@ -196,6 +283,7 @@ class VoiceInputApp:
         self.ui.set_status(f"モデル切替中: {next_model}")
         self._buffer_generation += 1
         self._drain_stt_queues()
+        self._session_audio_chunks = []
 
         try:
             self.transcriber = LocalTranscriber(
@@ -234,6 +322,7 @@ class VoiceInputApp:
         self._drain_stt_queues()
         while self.recorder.pop_chunk_nowait() is not None:
             pass
+        self._session_audio_chunks = []
 
         with self._text_lock:
             self._current_text = ""

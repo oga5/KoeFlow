@@ -198,7 +198,37 @@ class LocalTranscriber:
         self.backend = "faster-whisper"
         LOGGER.info("Fallback model loaded with faster-whisper: %s", self.fallback_model_id)
 
-    def transcribe(self, audio: np.ndarray, sample_rate: int) -> str:
+    def _transcribe_fallback_whisper(
+        self,
+        audio_f32: np.ndarray,
+        prompt_text: str,
+        final_pass: bool,
+    ) -> str:
+        assert self._fallback_whisper is not None
+        beam_size = 5 if final_pass else 1
+        best_of = 5 if final_pass else 1
+        condition_on_previous_text = final_pass
+        kwargs: dict[str, Any] = {
+            "language": "ja",
+            "vad_filter": True,
+            "beam_size": beam_size,
+            "best_of": best_of,
+            "temperature": 0.0,
+            "no_speech_threshold": 0.6,
+            "condition_on_previous_text": condition_on_previous_text,
+        }
+        if prompt_text:
+            kwargs["initial_prompt"] = prompt_text
+        segments, _ = self._fallback_whisper.transcribe(audio_f32, **kwargs)
+        return "".join(seg.text for seg in segments).strip()
+
+    def transcribe(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        prompt_text: str = "",
+        final_pass: bool = False,
+    ) -> str:
         if audio.size == 0:
             return ""
 
@@ -234,7 +264,7 @@ class LocalTranscriber:
                         "task": "transcribe",
                         "language": "ja",
                         "temperature": 0.0,
-                        "condition_on_prev_tokens": False,
+                        "condition_on_prev_tokens": final_pass,
                     },
                 )
                 text = result.get("text", "") if isinstance(result, dict) else str(result)
@@ -247,14 +277,8 @@ class LocalTranscriber:
         if self._fallback_whisper is None:
             self._load_fallback_whisper()
 
-        segments, _ = self._fallback_whisper.transcribe(
+        return self._transcribe_fallback_whisper(
             audio_f32,
-            language="ja",
-            vad_filter=True,
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
-            no_speech_threshold=0.6,
-            condition_on_previous_text=False,
+            prompt_text=prompt_text,
+            final_pass=final_pass,
         )
-        return "".join(seg.text for seg in segments).strip()

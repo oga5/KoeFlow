@@ -9,9 +9,10 @@ import sounddevice as sd
 
 
 class AudioCapture:
-    def __init__(self, sample_rate: int, channels: int = 1) -> None:
+    def __init__(self, sample_rate: int, channels: int = 1, chunk_seconds: float = 0.3) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
+        self.chunk_seconds = max(0.05, chunk_seconds)
         self._stream: Optional[sd.InputStream] = None
         self._lock = threading.Lock()
         self._recording = False
@@ -39,7 +40,7 @@ class AudioCapture:
             channels=self.channels,
             dtype="float32",
             callback=self._callback,
-            blocksize=int(self.sample_rate * 1.5),
+            blocksize=max(1, int(self.sample_rate * self.chunk_seconds)),
         )
         self._stream.start()
 
