@@ -89,9 +89,31 @@ class LocalTranscriber:
             self._load_fallback_whisper()
             return
 
+        if self.backend_preference in {"auto", ""} and self._looks_like_faster_whisper_target():
+            LOGGER.info("Primary model looks like faster-whisper format; preferring faster-whisper backend.")
+            if self._try_load_primary_faster_whisper():
+                return
+
         self._try_load_primary_transformers()
         if self._primary_pipe is None:
             self._load_fallback_whisper()
+
+    def _looks_like_faster_whisper_target(self) -> bool:
+        model_id_lower = self.primary_model_id.strip().lower()
+        if "faster-whisper" in model_id_lower:
+            return True
+        if self._is_complete_faster_whisper_model_dir(self._primary_local_dir):
+            return True
+        return False
+
+    def _is_complete_faster_whisper_model_dir(self, model_dir: Path) -> bool:
+        if not model_dir.exists():
+            return False
+        if not (model_dir / "model.bin").exists():
+            return False
+        if not (model_dir / "config.json").exists():
+            return False
+        return True
 
     def _find_first_existing(self, base_dir: Path, candidates: tuple[str, ...]) -> Optional[Path]:
         for name in candidates:
