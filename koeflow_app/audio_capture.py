@@ -9,10 +9,19 @@ import sounddevice as sd
 
 
 class AudioCapture:
-    def __init__(self, sample_rate: int, channels: int = 1, chunk_seconds: float = 0.3) -> None:
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int = 1,
+        chunk_seconds: float = 0.3,
+        blocksize: int = 1024,
+    ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk_seconds = max(0.05, chunk_seconds)
+        self.blocksize = max(1, int(blocksize))
+        self._target_chunk_samples = max(1, int(self.sample_rate * self.chunk_seconds))
+        self._pending_audio = np.empty(0, dtype=np.float32)
         self._stream: Optional[sd.InputStream] = None
         self._lock = threading.Lock()
         self._recording = False
@@ -35,18 +44,23 @@ class AudioCapture:
             except queue.Empty:
                 break
 
+        self._pending_audio = np.empty(0, dtype=np.float32)
+
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             channels=self.channels,
-            dtype="float32",
+            dtype="int16",
             callback=self._callback,
-            blocksize=max(1, int(self.sample_rate * self.chunk_seconds)),
+            blocksize=self.blocksize,
         )
         self._stream.start()
 
     def stop(self) -> None:
         with self._lock:
             self._recording = False
+            if self._pending_audio.size > 0:
+                self._chunk_queue.put(self._pending_audio.copy())
+                self._pending_audio = np.empty(0, dtype=np.float32)
 
         if self._stream is not None:
             self._stream.stop()
@@ -59,10 +73,15 @@ class AudioCapture:
         with self._lock:
             if not self._recording:
                 return
-        chunk = np.squeeze(indata.copy())
-        if chunk.ndim > 1:
-            chunk = chunk[:, 0]
-        self._chunk_queue.put(chunk)
+            chunk = np.squeeze(indata.copy())
+            if chunk.ndim > 1:
+                chunk = chunk[:, 0]
+            chunk_f32 = chunk.astype(np.float32) / 32768.0
+            self._pending_audio = np.concatenate((self._pending_audio, chunk_f32))
+            while self._pending_audio.size >= self._target_chunk_samples:
+                ready = self._pending_audio[: self._target_chunk_samples]
+                self._pending_audio = self._pending_audio[self._target_chunk_samples :]
+                self._chunk_queue.put(ready)
 
     def pop_chunk_nowait(self) -> Optional[np.ndarray]:
         try:

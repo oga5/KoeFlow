@@ -4,7 +4,6 @@ import logging
 import queue
 import threading
 import time
-from typing import Optional
 
 import numpy as np
 
@@ -34,20 +33,16 @@ class VoiceInputApp:
             sample_rate=self.config.sample_rate,
             channels=self.config.channels,
             chunk_seconds=self.config.audio_chunk_seconds,
+            blocksize=self.config.audio_blocksize,
         )
         self._model_presets = self.config.model_presets
+        if "sapi" not in {item.strip().lower() for item in self._model_presets}:
+            self._model_presets = (*self._model_presets, "sapi")
         self._active_model_index = 0
         initial_primary_model_id, initial_backend = self._resolve_transcriber_preset(
             self._model_presets[self._active_model_index]
         )
-        self.transcriber = LocalTranscriber(
-            primary_model_id=initial_primary_model_id,
-            fallback_model_id=self.config.fallback_model_id,
-            cache_dir=self.config.model_cache_dir,
-            backend=initial_backend,
-            sherpa_onnx_model_dir=self.config.sherpa_onnx_model_dir,
-            sherpa_onnx_model_type=self.config.sherpa_onnx_model_type,
-        )
+        self.transcriber = self._build_transcriber(initial_primary_model_id, initial_backend)
 
         self._recording = False
         self._text_lock = threading.Lock()
@@ -55,8 +50,15 @@ class VoiceInputApp:
         self._last_model_label = ""
         self._session_audio_chunks: list[np.ndarray] = []
         self._dropped_stt_chunks = 0
+        self._processed_stt_chunks = 0
         self._stt_stats_counter = 0
         self._buffer_generation = 0
+        self._last_mic_log_at = 0.0
+        self._mic_last_chunk_at = 0.0
+        self._mic_chunks_since_log = 0
+        self._mic_samples_since_log = 0
+        self._mic_rms_sum = 0.0
+        self._mic_peak_max = 0.0
         queue_maxsize = int(self.config.stt_input_queue_max)
         self._stt_input_queue: "queue.Queue[tuple[int, np.ndarray]]" = (
             queue.Queue() if queue_maxsize <= 0 else queue.Queue(maxsize=queue_maxsize)
@@ -91,8 +93,146 @@ class VoiceInputApp:
             self.config.switch_model_hotkey,
             self.config.clear_buffer_hotkey,
         )
+        LOGGER.info(
+            "Audio config: sample_rate=%d chunk=%.2fs blocksize=%d",
+            self.config.sample_rate,
+            self.config.audio_chunk_seconds,
+            self.config.audio_blocksize,
+        )
+        LOGGER.info(
+            (
+                "Decode config: realtime beam=%d best_of=%d finalize beam=%d best_of=%d "
+                "no_speech=%.2f light_vad=%s min_rms(rt/fn)=%.4f/%.4f max_cps=%.1f"
+            ),
+            self.config.realtime_beam_size,
+            self.config.realtime_best_of,
+            self.config.finalize_beam_size,
+            self.config.finalize_best_of,
+            self.config.whisper_no_speech_threshold,
+            self.config.use_light_vad_for_whisper,
+            self.config.realtime_min_rms,
+            self.config.finalize_min_rms,
+            self.config.realtime_max_chars_per_second,
+        )
+        LOGGER.info(
+            "Mic monitor: enabled=%s interval=%.1fs rms_threshold=%.4f",
+            self.config.mic_monitor_log_enabled,
+            self.config.mic_monitor_log_interval_seconds,
+            self.config.mic_monitor_rms_threshold,
+        )
         LOGGER.info("Active model: %s", self._model_presets[self._active_model_index])
         self.ui.run()
+
+    def _build_transcriber(self, primary_model_id: str, backend: str) -> LocalTranscriber:
+        return LocalTranscriber(
+            primary_model_id=primary_model_id,
+            fallback_model_id=self.config.fallback_model_id,
+            cache_dir=self.config.model_cache_dir,
+            backend=backend,
+            sherpa_onnx_model_dir=self.config.sherpa_onnx_model_dir,
+            sherpa_onnx_model_type=self.config.sherpa_onnx_model_type,
+            realtime_beam_size=self.config.realtime_beam_size,
+            realtime_best_of=self.config.realtime_best_of,
+            finalize_beam_size=self.config.finalize_beam_size,
+            finalize_best_of=self.config.finalize_best_of,
+            whisper_no_speech_threshold=self.config.whisper_no_speech_threshold,
+            realtime_condition_on_previous_text=self.config.realtime_condition_on_previous_text,
+            finalize_condition_on_previous_text=self.config.finalize_condition_on_previous_text,
+            use_light_vad_for_whisper=self.config.use_light_vad_for_whisper,
+            realtime_min_rms=self.config.realtime_min_rms,
+            finalize_min_rms=self.config.finalize_min_rms,
+        )
+
+    def _drop_rate_percent(self) -> float:
+        total = self._processed_stt_chunks + self._dropped_stt_chunks
+        if total <= 0:
+            return 0.0
+        return (self._dropped_stt_chunks / float(total)) * 100.0
+
+    @staticmethod
+    def _needs_ascii_space(left_char: str, right_char: str) -> bool:
+        if not left_char or not right_char:
+            return False
+        if left_char.isspace() or right_char.isspace():
+            return False
+        if not left_char.isascii() or not right_char.isascii():
+            return False
+        return left_char.isalnum() and right_char.isalnum()
+
+    def _merge_realtime_piece(self, base_text: str, new_piece: str) -> str:
+        left = base_text.strip()
+        right = new_piece.strip()
+        if not right:
+            return left
+        if not left:
+            return right
+
+        overlap_limit = max(0, int(self.config.realtime_merge_max_overlap_chars))
+        max_overlap = min(overlap_limit, len(left), len(right))
+        overlap = 0
+        for size in range(max_overlap, 0, -1):
+            if left[-size:] == right[:size]:
+                overlap = size
+                break
+
+        merged_piece = right[overlap:]
+        if not merged_piece:
+            return left
+
+        if self._needs_ascii_space(left[-1], merged_piece[0]):
+            return f"{left} {merged_piece}"
+        return f"{left}{merged_piece}"
+
+    def _track_mic_chunk(self, chunk: np.ndarray) -> None:
+        if chunk.size <= 0:
+            return
+        rms = float(np.sqrt(np.mean(np.square(chunk))))
+        peak = float(np.max(np.abs(chunk)))
+        self._mic_chunks_since_log += 1
+        self._mic_samples_since_log += int(chunk.size)
+        self._mic_rms_sum += rms
+        self._mic_peak_max = max(self._mic_peak_max, peak)
+        self._mic_last_chunk_at = time.monotonic()
+
+    def _emit_mic_monitor_log(self, force: bool = False) -> None:
+        if not self.config.mic_monitor_log_enabled:
+            return
+        now = time.monotonic()
+        interval = max(0.2, float(self.config.mic_monitor_log_interval_seconds))
+        if not force and (now - self._last_mic_log_at) < interval:
+            return
+
+        if self._mic_chunks_since_log > 0:
+            avg_rms = self._mic_rms_sum / float(self._mic_chunks_since_log)
+            captured_seconds = self._mic_samples_since_log / float(self.config.sample_rate)
+            speech = avg_rms >= float(self.config.mic_monitor_rms_threshold)
+            LOGGER.info(
+                "MIC monitor: chunks=%d audio=%.2fs avg_rms=%.4f peak=%.4f speech=%s q_in=%d",
+                self._mic_chunks_since_log,
+                captured_seconds,
+                avg_rms,
+                self._mic_peak_max,
+                "yes" if speech else "no",
+                self._stt_input_queue.qsize(),
+            )
+        else:
+            silence_seconds = max(0.0, now - self._mic_last_chunk_at)
+            LOGGER.info(
+                "MIC monitor: no chunks for %.1fs (recording=%s q_in=%d)",
+                silence_seconds,
+                self._recording,
+                self._stt_input_queue.qsize(),
+            )
+
+        self._last_mic_log_at = now
+        self._mic_chunks_since_log = 0
+        self._mic_samples_since_log = 0
+        self._mic_rms_sum = 0.0
+        self._mic_peak_max = 0.0
+
+    @staticmethod
+    def _realtime_char_count(text: str) -> int:
+        return sum(1 for ch in text if not ch.isspace())
 
     def toggle_recording(self) -> None:
         if not self._recording:
@@ -102,6 +242,16 @@ class VoiceInputApp:
 
     def _start_recording(self) -> None:
         self._session_audio_chunks = []
+        self._dropped_stt_chunks = 0
+        self._processed_stt_chunks = 0
+        self._stt_stats_counter = 0
+        now = time.monotonic()
+        self._last_mic_log_at = now
+        self._mic_last_chunk_at = now
+        self._mic_chunks_since_log = 0
+        self._mic_samples_since_log = 0
+        self._mic_rms_sum = 0.0
+        self._mic_peak_max = 0.0
         self.recorder.start()
         self._recording = True
         self.ui.set_status("録音中...")
@@ -109,8 +259,17 @@ class VoiceInputApp:
     def _stop_recording(self) -> None:
         self.recorder.stop()
         self._collect_pending_audio_chunks()
+        self._emit_mic_monitor_log(force=True)
         self._recording = False
         self.ui.set_status("待機中")
+
+    def _ensure_mic_off(self) -> None:
+        if self._recording:
+            self._stop_recording()
+            return
+        if self.recorder.is_recording:
+            self.recorder.stop()
+        self._collect_pending_audio_chunks()
 
     def _schedule_pump(self) -> None:
         self._pump_audio_chunks()
@@ -121,13 +280,15 @@ class VoiceInputApp:
     def _current_model_label(self) -> str:
         selected_model = self._model_presets[self._active_model_index]
         if self.transcriber.backend == "faster-whisper":
-            return self.config.fallback_model_id
+            return self.transcriber.active_faster_whisper_model_id
         return selected_model
 
     def _resolve_transcriber_preset(self, preset: str) -> tuple[str, str]:
         normalized = preset.strip()
         if normalized.lower() in {"sherpa-onnx", "sherpa_onnx", "sherpa"}:
             return self.config.primary_model_id, "sherpa-onnx"
+        if normalized.lower() in {"sapi", "windows-sapi", "windows_sapi"}:
+            return self.config.primary_model_id, "sapi"
         return normalized, self.config.transcriber_backend
 
     def _refresh_model_label(self, force: bool = False) -> None:
@@ -145,8 +306,10 @@ class VoiceInputApp:
             if chunk is None:
                 break
             if chunk.size > 0:
+                self._track_mic_chunk(chunk)
                 self._session_audio_chunks.append(chunk)
                 self._enqueue_stt_chunk(generation, chunk)
+        self._emit_mic_monitor_log()
 
     def _collect_pending_audio_chunks(self) -> None:
         while True:
@@ -154,6 +317,7 @@ class VoiceInputApp:
             if chunk is None:
                 break
             if chunk.size > 0:
+                self._track_mic_chunk(chunk)
                 self._session_audio_chunks.append(chunk)
 
     def _enqueue_stt_chunk(self, generation: int, chunk: np.ndarray) -> None:
@@ -172,8 +336,10 @@ class VoiceInputApp:
             except queue.Empty:
                 continue
             try:
-                with self._text_lock:
-                    prompt_tail = self._current_text[-self.config.realtime_context_chars :].strip()
+                prompt_tail = ""
+                if self.config.realtime_condition_on_previous_text:
+                    with self._text_lock:
+                        prompt_tail = self._current_text[-self.config.realtime_context_chars :].strip()
                 started_at = time.perf_counter()
                 text = self.transcriber.transcribe(
                     chunk,
@@ -181,20 +347,39 @@ class VoiceInputApp:
                     prompt_text=prompt_tail,
                     final_pass=False,
                 )
+                self._processed_stt_chunks += 1
                 elapsed = time.perf_counter() - started_at
                 chunk_seconds = float(chunk.size) / float(self.config.sample_rate)
                 rtf = elapsed / chunk_seconds if chunk_seconds > 0 else 0.0
                 self._stt_stats_counter += 1
                 if self._stt_stats_counter % 10 == 0:
                     LOGGER.info(
-                        "STT stats: chunk=%.2fs infer=%.0fms rtf=%.2f q_in=%d q_out=%d dropped=%d",
+                        (
+                            "STT realtime: model=%s backend=%s chunk=%.2fs infer=%.0fms rtf=%.2f "
+                            "q_in=%d q_out=%d dropped=%d drop_rate=%.1f%%"
+                        ),
+                        self._current_model_label(),
+                        self.transcriber.backend,
                         chunk_seconds,
                         elapsed * 1000.0,
                         rtf,
                         self._stt_input_queue.qsize(),
                         self._stt_output_queue.qsize(),
                         self._dropped_stt_chunks,
+                        self._drop_rate_percent(),
                     )
+                max_chars_per_second = float(self.config.realtime_max_chars_per_second)
+                if text and max_chars_per_second > 0 and chunk_seconds > 0:
+                    char_rate = self._realtime_char_count(text) / chunk_seconds
+                    if char_rate > max_chars_per_second:
+                        LOGGER.info(
+                            "STT realtime filtered: model=%s cps=%.1f threshold=%.1f text=%r",
+                            self._current_model_label(),
+                            char_rate,
+                            max_chars_per_second,
+                            text,
+                        )
+                        text = ""
                 if text:
                     self._stt_output_queue.put((generation, text))
             except Exception as exc:  # noqa: BLE001
@@ -210,7 +395,7 @@ class VoiceInputApp:
             if generation != self._buffer_generation:
                 continue
             with self._text_lock:
-                self._current_text = f"{self._current_text} {piece}".strip()
+                self._current_text = self._merge_realtime_piece(self._current_text, piece)
             updated = True
 
         if updated:
@@ -219,8 +404,9 @@ class VoiceInputApp:
             self.ui.set_text(text)
 
     def confirm_and_paste(self) -> None:
-        if self._recording:
-            self._stop_recording()
+        self._ensure_mic_off()
+        self._buffer_generation += 1
+        self._drain_stt_queues()
 
         if self.config.enable_finalize_pass:
             finalized = self._run_finalize_pass()
@@ -262,10 +448,14 @@ class VoiceInputApp:
         audio_seconds = float(merged_audio.size) / float(self.config.sample_rate)
         rtf = elapsed / audio_seconds if audio_seconds > 0 else 0.0
         LOGGER.info(
-            "Finalize pass: audio=%.2fs infer=%.0fms rtf=%.2f",
+            "STT finalize: model=%s backend=%s audio=%.2fs infer=%.0fms rtf=%.2f dropped=%d drop_rate=%.1f%%",
+            self._current_model_label(),
+            self.transcriber.backend,
             audio_seconds,
             elapsed * 1000.0,
             rtf,
+            self._dropped_stt_chunks,
+            self._drop_rate_percent(),
         )
         return finalized.strip()
 
@@ -286,14 +476,7 @@ class VoiceInputApp:
         self._session_audio_chunks = []
 
         try:
-            self.transcriber = LocalTranscriber(
-                primary_model_id=next_primary_model_id,
-                fallback_model_id=self.config.fallback_model_id,
-                cache_dir=self.config.model_cache_dir,
-                backend=next_backend,
-                sherpa_onnx_model_dir=self.config.sherpa_onnx_model_dir,
-                sherpa_onnx_model_type=self.config.sherpa_onnx_model_type,
-            )
+            self.transcriber = self._build_transcriber(next_primary_model_id, next_backend)
             LOGGER.info("Switched model: %s", next_model)
             self._refresh_model_label(force=True)
             self.ui.set_status(f"モデル切替完了: {next_model}")
