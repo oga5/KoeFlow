@@ -19,6 +19,7 @@ LIGHT_VAD_FRAME_SECONDS = 0.03
 LIGHT_VAD_PAD_SECONDS = 0.12
 LIGHT_VAD_ENERGY_THRESHOLD = 0.004
 LIGHT_VAD_MIN_SPEECH_SECONDS = 0.15
+PRIMARY_TRANSFORMERS_REDOWNLOAD_LIMIT = 2
 
 
 class LocalTranscriber:
@@ -64,6 +65,9 @@ class LocalTranscriber:
             configured_primary_path
             if self._primary_is_existing_local_path
             else self.cache_dir / "primary" / self.primary_model_id.replace("/", "--")
+        )
+        self._primary_transformers_redownload_count_file = (
+            self.cache_dir / "primary" / f"{self._primary_local_dir.name}.transformers_redownload_count"
         )
         self._fallback_download_root = self.cache_dir / "fallback"
 
@@ -114,6 +118,27 @@ class LocalTranscriber:
         if not (model_dir / "config.json").exists():
             return False
         return True
+
+    def _read_primary_transformers_redownload_count(self) -> int:
+        try:
+            raw = self._primary_transformers_redownload_count_file.read_text(encoding="utf-8").strip()
+            return max(0, int(raw))
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _write_primary_transformers_redownload_count(self, count: int) -> None:
+        try:
+            self._primary_transformers_redownload_count_file.parent.mkdir(parents=True, exist_ok=True)
+            self._primary_transformers_redownload_count_file.write_text(str(max(0, int(count))), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            return
+
+    def _clear_primary_transformers_redownload_count(self) -> None:
+        try:
+            if self._primary_transformers_redownload_count_file.exists():
+                self._primary_transformers_redownload_count_file.unlink()
+        except Exception:  # noqa: BLE001
+            return
 
     def _find_first_existing(self, base_dir: Path, candidates: tuple[str, ...]) -> Optional[Path]:
         for name in candidates:
@@ -210,13 +235,28 @@ class LocalTranscriber:
 
             needs_download = not self._is_complete_transformers_model_dir(self._primary_local_dir)
             if needs_download and not self._primary_is_existing_local_path:
-                if self._primary_local_dir.exists():
-                    LOGGER.warning("Primary cache looks incomplete. Re-downloading: %s", self._primary_local_dir)
-                    shutil.rmtree(self._primary_local_dir, ignore_errors=True)
-                snapshot_download(
-                    repo_id=self.primary_model_id,
-                    local_dir=str(self._primary_local_dir),
-                )
+                redownload_count = self._read_primary_transformers_redownload_count()
+                if redownload_count >= PRIMARY_TRANSFORMERS_REDOWNLOAD_LIMIT:
+                    LOGGER.warning(
+                        "Primary cache looks incomplete after %d re-download attempts. "
+                        "Skipping re-download: %s",
+                        redownload_count,
+                        self._primary_local_dir,
+                    )
+                else:
+                    if self._primary_local_dir.exists():
+                        LOGGER.warning(
+                            "Primary cache looks incomplete. Re-downloading (%d/%d): %s",
+                            redownload_count + 1,
+                            PRIMARY_TRANSFORMERS_REDOWNLOAD_LIMIT,
+                            self._primary_local_dir,
+                        )
+                        shutil.rmtree(self._primary_local_dir, ignore_errors=True)
+                    snapshot_download(
+                        repo_id=self.primary_model_id,
+                        local_dir=str(self._primary_local_dir),
+                    )
+                    self._write_primary_transformers_redownload_count(redownload_count + 1)
 
             self._primary_pipe = pipeline(
                 task="automatic-speech-recognition",
@@ -224,6 +264,7 @@ class LocalTranscriber:
                 device=-1,
                 trust_remote_code=True,
             )
+            self._clear_primary_transformers_redownload_count()
             self.backend = "transformers"
             LOGGER.info("Primary model loaded with transformers: %s", self.primary_model_id)
         except Exception as exc:  # noqa: BLE001
