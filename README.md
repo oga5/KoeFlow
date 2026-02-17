@@ -2,9 +2,9 @@
 
 ローカルCPUで動く音声入力アプリです。  
 - `Ctrl+Alt+V`: 録音開始/停止（トグル）
-- `Enter`: 現在の文字起こしをアクティブウィンドウに貼り付け
+- `Enter`: （KoeFlowウィンドウがアクティブなときのみ）現在の文字起こしを貼り付け
 - `Ctrl+Alt+M`: モデル切り替え（`MODEL_PRESETS`を順番に循環）
-- `Esc`: 録音中バッファをクリア（プレビューと未処理キューを破棄）
+- `Esc`: （KoeFlowウィンドウがアクティブなときのみ）バッファをクリア（録音中/待機中どちらでも可）
 
 ## 1. セットアップ
 
@@ -36,6 +36,8 @@ D:\Tools\Python3.11.9\python.exe -m venv .venv
 - `MODEL_CACHE_DIR`: モデル保存先（既定: `.models`）
 - `SAMPLE_RATE`: 録音サンプルレート（既定: `48000`、デバイスが対応するなら `16000` 推奨）
 - `AUDIO_CHUNK_SECONDS`: リアルタイム認識のチャンク秒数（既定: `0.6`、精度寄りは `0.8`〜`1.2`）
+- `AUDIO_MAX_CHUNK_LATENCY_SECONDS`: 途中確定でチャンクを先送りする最大待ち時間（既定: `0.6`、レスポンス重視なら `0.35`〜`0.5`）
+- `UI_PUMP_INTERVAL_MS`: UIポーリング間隔（既定: `120`、レスポンス重視なら `60`〜`100`）
 - `REALTIME_MAX_CHARS_PER_SECOND`: リアルタイムで不自然に長い出力を破棄する上限（既定: `14`）
 - `REALTIME_MERGE_MAX_OVERLAP_CHARS`: チャンク連結時の重複除去文字数（既定: `12`）
 - `REALTIME_BEAM_SIZE` / `REALTIME_BEST_OF`: リアルタイム推論の探索幅（既定: `1` / `1`）
@@ -52,7 +54,7 @@ D:\Tools\Python3.11.9\python.exe -m venv .venv
 - `TOGGLE_HOTKEY`: 録音トグル（既定: `ctrl+alt+v`）
 - `CONFIRM_HOTKEY`: 貼り付け確定（既定: `enter`）
 - `SWITCH_MODEL_HOTKEY`: モデル切替（既定: `ctrl+alt+m`）
-- `CLEAR_BUFFER_HOTKEY`: 録音中バッファクリア（既定: `esc`）
+- `CLEAR_BUFFER_HOTKEY`: バッファクリア（KoeFlowウィンドウがアクティブなときのみ、既定: `esc`）
 
 ### 日本語精度を優先する推奨 `.env`（CPU）
 
@@ -62,6 +64,8 @@ TRANSCRIBER_BACKEND=faster-whisper
 
 SAMPLE_RATE=16000
 AUDIO_CHUNK_SECONDS=0.6
+AUDIO_MAX_CHUNK_LATENCY_SECONDS=0.45
+UI_PUMP_INTERVAL_MS=80
 
 REALTIME_BEAM_SIZE=1
 REALTIME_BEST_OF=1

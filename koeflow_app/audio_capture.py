@@ -14,13 +14,22 @@ class AudioCapture:
         sample_rate: int,
         channels: int = 1,
         chunk_seconds: float = 0.3,
+        max_chunk_latency_seconds: float = 0.0,
         blocksize: int = 1024,
     ) -> None:
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk_seconds = max(0.05, chunk_seconds)
+        max_latency = float(max_chunk_latency_seconds)
+        if max_latency <= 0.0:
+            max_latency = self.chunk_seconds
+        self.max_chunk_latency_seconds = max(0.05, max_latency)
         self.blocksize = max(1, int(blocksize))
         self._target_chunk_samples = max(1, int(self.sample_rate * self.chunk_seconds))
+        self._max_chunk_latency_samples = max(
+            1,
+            int(self.sample_rate * min(self.chunk_seconds, self.max_chunk_latency_seconds)),
+        )
         self._pending_audio = np.empty(0, dtype=np.float32)
         self._stream: Optional[sd.InputStream] = None
         self._lock = threading.Lock()
@@ -82,6 +91,9 @@ class AudioCapture:
                 ready = self._pending_audio[: self._target_chunk_samples]
                 self._pending_audio = self._pending_audio[self._target_chunk_samples :]
                 self._chunk_queue.put(ready)
+            if self._pending_audio.size >= self._max_chunk_latency_samples:
+                self._chunk_queue.put(self._pending_audio.copy())
+                self._pending_audio = np.empty(0, dtype=np.float32)
 
     def pop_chunk_nowait(self) -> Optional[np.ndarray]:
         try:

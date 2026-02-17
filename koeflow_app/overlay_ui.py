@@ -17,6 +17,10 @@ class OverlayUI:
         self.root.title(title)
         self.root.geometry("560x260+40+40")
         self.root.attributes("-topmost", True)
+        self._is_active = False
+
+        self.root.bind_all("<FocusIn>", self._on_focus_in, add="+")
+        self.root.bind_all("<FocusOut>", self._on_focus_out, add="+")
 
         frame = ttk.Frame(self.root, padding=10)
         frame.pack(fill="both", expand=True)
@@ -55,6 +59,16 @@ class OverlayUI:
         self.text.delete("1.0", "end")
         self.text.insert("1.0", value)
         self.text.configure(state="disabled")
+
+    def _on_focus_in(self, _event) -> None:  # noqa: ANN001
+        self._is_active = True
+
+    def _on_focus_out(self, _event) -> None:  # noqa: ANN001
+        self._is_active = False
+
+    @property
+    def is_active(self) -> bool:
+        return self._is_active
 
     def run(self) -> None:
         self.root.mainloop()

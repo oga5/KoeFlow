@@ -20,6 +20,7 @@ LIGHT_VAD_PAD_SECONDS = 0.12
 LIGHT_VAD_ENERGY_THRESHOLD = 0.004
 LIGHT_VAD_MIN_SPEECH_SECONDS = 0.15
 PRIMARY_TRANSFORMERS_REDOWNLOAD_LIMIT = 2
+VAD_FILTER_MIN_AUDIO_SECONDS = 2.0
 
 
 class LocalTranscriber:
@@ -379,9 +380,11 @@ class LocalTranscriber:
         condition_on_previous_text = (
             self.finalize_condition_on_previous_text if final_pass else self.realtime_condition_on_previous_text
         )
+        audio_seconds = float(audio_f32.size) / float(TARGET_SAMPLE_RATE)
+        use_vad_filter = audio_seconds >= VAD_FILTER_MIN_AUDIO_SECONDS
         kwargs: dict[str, Any] = {
             "language": "ja",
-            "vad_filter": True,
+            "vad_filter": use_vad_filter,
             "beam_size": beam_size,
             "best_of": best_of,
             "temperature": 0.0,

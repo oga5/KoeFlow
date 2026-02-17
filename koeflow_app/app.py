@@ -33,6 +33,7 @@ class VoiceInputApp:
             sample_rate=self.config.sample_rate,
             channels=self.config.channels,
             chunk_seconds=self.config.audio_chunk_seconds,
+            max_chunk_latency_seconds=self.config.audio_max_chunk_latency_seconds,
             blocksize=self.config.audio_blocksize,
         )
         self._model_presets = self.config.model_presets
@@ -47,6 +48,7 @@ class VoiceInputApp:
         self._recording = False
         self._text_lock = threading.Lock()
         self._current_text = ""
+        self._confirmed_text = ""
         self._last_model_label = ""
         self._session_audio_chunks: list[np.ndarray] = []
         self._dropped_stt_chunks = 0
@@ -59,11 +61,15 @@ class VoiceInputApp:
         self._mic_samples_since_log = 0
         self._mic_rms_sum = 0.0
         self._mic_peak_max = 0.0
-        queue_maxsize = int(self.config.stt_input_queue_max)
-        self._stt_input_queue: "queue.Queue[tuple[int, np.ndarray]]" = (
-            queue.Queue() if queue_maxsize <= 0 else queue.Queue(maxsize=queue_maxsize)
+        self._sliding_window_samples = max(
+            1, int(self.config.sample_rate * self.config.sliding_window_seconds)
         )
-        self._stt_output_queue: "queue.Queue[tuple[int, str]]" = queue.Queue()
+        self._sliding_audio_buffer = np.empty(0, dtype=np.float32)
+        self._sliding_audio_lock = threading.Lock()
+        self._stt_sequence = 0
+        self._stt_input_queue: "queue.Queue[tuple[int, int, np.ndarray]]" = queue.Queue(maxsize=2)
+        self._stt_output_queue: "queue.Queue[tuple[int, int, str]]" = queue.Queue()
+        self._last_sliding_text = ""
         self._stop_worker = threading.Event()
         self._worker = threading.Thread(target=self._stt_worker, daemon=True)
         self._worker.start()
@@ -72,11 +78,11 @@ class VoiceInputApp:
             toggle_hotkey=self.config.toggle_hotkey,
             confirm_hotkey=self.config.confirm_hotkey,
             on_toggle=self.toggle_recording,
-            on_confirm=self.confirm_and_paste,
+            on_confirm=self._on_confirm_hotkey,
             switch_model_hotkey=self.config.switch_model_hotkey,
-            on_switch_model=self.switch_model,
+            on_switch_model=self._on_switch_model_hotkey,
             clear_buffer_hotkey=self.config.clear_buffer_hotkey,
-            on_clear_buffer=self.clear_recording_buffer,
+            on_clear_buffer=self._on_clear_buffer_hotkey,
         )
 
         self.ui.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -94,9 +100,10 @@ class VoiceInputApp:
             self.config.clear_buffer_hotkey,
         )
         LOGGER.info(
-            "Audio config: sample_rate=%d chunk=%.2fs blocksize=%d",
+            "Audio config: sample_rate=%d chunk=%.2fs max_chunk_latency=%.2fs blocksize=%d",
             self.config.sample_rate,
             self.config.audio_chunk_seconds,
+            self.config.audio_max_chunk_latency_seconds,
             self.config.audio_blocksize,
         )
         LOGGER.info(
@@ -119,6 +126,13 @@ class VoiceInputApp:
             self.config.mic_monitor_log_enabled,
             self.config.mic_monitor_log_interval_seconds,
             self.config.mic_monitor_rms_threshold,
+        )
+        LOGGER.info(
+            "Sliding window: window=%.1fs step=%.1fs hallucination_rep=%d blacklist=%d items",
+            self.config.sliding_window_seconds,
+            self.config.sliding_window_step_seconds,
+            self.config.hallucination_repetition_threshold,
+            len(self.config.hallucination_blacklist),
         )
         LOGGER.info("Active model: %s", self._model_presets[self._active_model_index])
         self.ui.run()
@@ -240,6 +254,21 @@ class VoiceInputApp:
         else:
             self._stop_recording()
 
+    def _on_confirm_hotkey(self) -> None:
+        if not self.ui.is_active:
+            return
+        self.confirm_and_paste()
+
+    def _on_clear_buffer_hotkey(self) -> None:
+        if not self.ui.is_active:
+            return
+        self.clear_recording_buffer()
+
+    def _on_switch_model_hotkey(self) -> None:
+        if not self.ui.is_active:
+            return
+        self.switch_model()
+
     def _start_recording(self) -> None:
         self._session_audio_chunks = []
         self._dropped_stt_chunks = 0
@@ -252,6 +281,11 @@ class VoiceInputApp:
         self._mic_samples_since_log = 0
         self._mic_rms_sum = 0.0
         self._mic_peak_max = 0.0
+        with self._sliding_audio_lock:
+            self._sliding_audio_buffer = np.empty(0, dtype=np.float32)
+        self._last_sliding_text = ""
+        with self._text_lock:
+            self._confirmed_text = ""
         self.recorder.start()
         self._recording = True
         self.ui.set_status("録音中...")
@@ -275,7 +309,8 @@ class VoiceInputApp:
         self._pump_audio_chunks()
         self._pump_stt_output()
         self._refresh_model_label()
-        self.ui.root.after(200, self._schedule_pump)
+        interval_ms = max(30, int(self.config.ui_pump_interval_ms))
+        self.ui.root.after(interval_ms, self._schedule_pump)
 
     def _current_model_label(self) -> str:
         selected_model = self._model_presets[self._active_model_index]
@@ -300,7 +335,7 @@ class VoiceInputApp:
     def _pump_audio_chunks(self) -> None:
         if not self._recording:
             return
-        generation = self._buffer_generation
+        new_samples = False
         while True:
             chunk = self.recorder.pop_chunk_nowait()
             if chunk is None:
@@ -308,7 +343,17 @@ class VoiceInputApp:
             if chunk.size > 0:
                 self._track_mic_chunk(chunk)
                 self._session_audio_chunks.append(chunk)
-                self._enqueue_stt_chunk(generation, chunk)
+                with self._sliding_audio_lock:
+                    self._sliding_audio_buffer = np.concatenate(
+                        (self._sliding_audio_buffer, chunk)
+                    )
+                    if self._sliding_audio_buffer.size > self._sliding_window_samples:
+                        self._sliding_audio_buffer = self._sliding_audio_buffer[
+                            -self._sliding_window_samples :
+                        ]
+                new_samples = True
+        if new_samples:
+            self._enqueue_sliding_window()
         self._emit_mic_monitor_log()
 
     def _collect_pending_audio_chunks(self) -> None:
@@ -319,48 +364,72 @@ class VoiceInputApp:
             if chunk.size > 0:
                 self._track_mic_chunk(chunk)
                 self._session_audio_chunks.append(chunk)
+                with self._sliding_audio_lock:
+                    self._sliding_audio_buffer = np.concatenate(
+                        (self._sliding_audio_buffer, chunk)
+                    )
+                    if self._sliding_audio_buffer.size > self._sliding_window_samples:
+                        self._sliding_audio_buffer = self._sliding_audio_buffer[
+                            -self._sliding_window_samples :
+                        ]
 
-    def _enqueue_stt_chunk(self, generation: int, chunk: np.ndarray) -> None:
-        if self._stt_input_queue.full():
-            self._dropped_stt_chunks += 1
+    def _enqueue_sliding_window(self) -> None:
+        with self._sliding_audio_lock:
+            window_audio = self._sliding_audio_buffer.copy()
+        if window_audio.size == 0:
             return
+        generation = self._buffer_generation
+        self._stt_sequence += 1
+        seq = self._stt_sequence
+        # Drop old items to keep only the latest window in the queue
+        while not self._stt_input_queue.empty():
+            try:
+                self._stt_input_queue.get_nowait()
+                self._dropped_stt_chunks += 1
+            except queue.Empty:
+                break
         try:
-            self._stt_input_queue.put_nowait((generation, chunk))
+            self._stt_input_queue.put_nowait((generation, seq, window_audio))
         except queue.Full:
             self._dropped_stt_chunks += 1
 
     def _stt_worker(self) -> None:
         while not self._stop_worker.is_set():
             try:
-                generation, chunk = self._stt_input_queue.get(timeout=0.2)
+                generation, seq, window_audio = self._stt_input_queue.get(timeout=0.2)
             except queue.Empty:
+                continue
+            # Skip stale: if a newer sequence is already queued, discard this one
+            if seq < self._stt_sequence:
+                self._dropped_stt_chunks += 1
                 continue
             try:
                 prompt_tail = ""
                 if self.config.realtime_condition_on_previous_text:
                     with self._text_lock:
-                        prompt_tail = self._current_text[-self.config.realtime_context_chars :].strip()
+                        full = self._confirmed_text + self._current_text
+                        prompt_tail = full[-self.config.realtime_context_chars :].strip()
                 started_at = time.perf_counter()
                 text = self.transcriber.transcribe(
-                    chunk,
+                    window_audio,
                     self.config.sample_rate,
                     prompt_text=prompt_tail,
                     final_pass=False,
                 )
                 self._processed_stt_chunks += 1
                 elapsed = time.perf_counter() - started_at
-                chunk_seconds = float(chunk.size) / float(self.config.sample_rate)
-                rtf = elapsed / chunk_seconds if chunk_seconds > 0 else 0.0
+                audio_seconds = float(window_audio.size) / float(self.config.sample_rate)
+                rtf = elapsed / audio_seconds if audio_seconds > 0 else 0.0
                 self._stt_stats_counter += 1
-                if self._stt_stats_counter % 10 == 0:
+                if self._stt_stats_counter % 5 == 0:
                     LOGGER.info(
                         (
-                            "STT realtime: model=%s backend=%s chunk=%.2fs infer=%.0fms rtf=%.2f "
+                            "STT realtime: model=%s backend=%s window=%.2fs infer=%.0fms rtf=%.2f "
                             "q_in=%d q_out=%d dropped=%d drop_rate=%.1f%%"
                         ),
                         self._current_model_label(),
                         self.transcriber.backend,
-                        chunk_seconds,
+                        audio_seconds,
                         elapsed * 1000.0,
                         rtf,
                         self._stt_input_queue.qsize(),
@@ -369,39 +438,107 @@ class VoiceInputApp:
                         self._drop_rate_percent(),
                     )
                 max_chars_per_second = float(self.config.realtime_max_chars_per_second)
-                if text and max_chars_per_second > 0 and chunk_seconds > 0:
-                    char_rate = self._realtime_char_count(text) / chunk_seconds
+                if text and max_chars_per_second > 0 and audio_seconds > 0:
+                    char_rate = self._realtime_char_count(text) / audio_seconds
                     if char_rate > max_chars_per_second:
                         LOGGER.info(
-                            "STT realtime filtered: model=%s cps=%.1f threshold=%.1f text=%r",
+                            "STT realtime filtered (cps): model=%s cps=%.1f threshold=%.1f text=%r",
                             self._current_model_label(),
                             char_rate,
                             max_chars_per_second,
                             text,
                         )
                         text = ""
+                if text and self._is_hallucination(text):
+                    LOGGER.info("STT realtime filtered (hallucination): %r", text)
+                    text = ""
                 if text:
-                    self._stt_output_queue.put((generation, text))
+                    self._stt_output_queue.put((generation, seq, text))
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Transcription failed: %s", exc)
 
+    def _is_hallucination(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        for bl in self.config.hallucination_blacklist:
+            if bl and stripped == bl:
+                return True
+        rep_threshold = max(1, self.config.hallucination_repetition_threshold)
+        if len(stripped) >= 4:
+            for seg_len in range(2, len(stripped) // rep_threshold + 1):
+                segment = stripped[:seg_len]
+                if segment * rep_threshold == stripped[: seg_len * rep_threshold]:
+                    if seg_len * rep_threshold >= len(stripped) * 0.7:
+                        return True
+        return False
+
+    @staticmethod
+    def _common_prefix_len(a: str, b: str) -> int:
+        limit = min(len(a), len(b))
+        i = 0
+        while i < limit and a[i] == b[i]:
+            i += 1
+        return i
+
     def _pump_stt_output(self) -> None:
-        updated = False
+        latest_text = None
+        latest_gen = None
         while True:
             try:
-                generation, piece = self._stt_output_queue.get_nowait()
+                generation, seq, full_window_text = self._stt_output_queue.get_nowait()
             except queue.Empty:
                 break
             if generation != self._buffer_generation:
                 continue
-            with self._text_lock:
-                self._current_text = self._merge_realtime_piece(self._current_text, piece)
-            updated = True
+            latest_gen = generation
+            latest_text = full_window_text
 
-        if updated:
+        if latest_text is not None and latest_gen == self._buffer_generation:
+            prev = self._last_sliding_text
+            curr = latest_text
+
+            if prev and curr:
+                common_len = self._common_prefix_len(prev, curr)
+                if common_len < len(prev):
+                    # The window moved: text after common prefix in prev was dropped.
+                    # But text *before* common prefix is stable — confirm it when
+                    # the new result no longer starts with the old beginning.
+                    lost_prefix = prev[:common_len]
+                    # If current result lost the beginning of previous result,
+                    # that beginning has scrolled out of the window — confirm it.
+                    if not curr.startswith(prev):
+                        # Find how much of prev is NOT in curr anymore
+                        # by checking where curr content starts within prev
+                        overlap = self._find_overlap_start(prev, curr)
+                        if overlap > 0:
+                            with self._text_lock:
+                                self._confirmed_text += prev[:overlap]
+                            curr = curr  # curr is the new window text as-is
+
+            self._last_sliding_text = curr
             with self._text_lock:
-                text = self._current_text
-            self.ui.set_text(text)
+                self._current_text = curr
+                display = self._confirmed_text + self._current_text
+            self.ui.set_text(display)
+
+    @staticmethod
+    def _find_overlap_start(prev: str, curr: str) -> int:
+        """Find how many characters from the start of prev are no longer
+        present at the start of curr (i.e. they scrolled out of the window).
+        We look for the longest suffix of prev's beginning that matches
+        the beginning of curr."""
+        if curr.startswith(prev):
+            return 0
+        # Try to find where curr's start appears in prev
+        # The confirmed portion is everything in prev before that point
+        best = 0
+        for i in range(1, len(prev) + 1):
+            suffix = prev[i:]
+            if curr.startswith(suffix) and len(suffix) > 0:
+                best = i
+                break
+        return best
 
     def confirm_and_paste(self) -> None:
         self._ensure_mic_off()
@@ -412,11 +549,12 @@ class VoiceInputApp:
             finalized = self._run_finalize_pass()
             if finalized:
                 with self._text_lock:
+                    self._confirmed_text = ""
                     self._current_text = finalized
                 self.ui.set_text(finalized)
 
         with self._text_lock:
-            text = self._current_text.strip()
+            text = (self._confirmed_text + self._current_text).strip()
 
         if not text:
             return
@@ -425,7 +563,11 @@ class VoiceInputApp:
 
         with self._text_lock:
             self._current_text = ""
+            self._confirmed_text = ""
         self._session_audio_chunks = []
+        with self._sliding_audio_lock:
+            self._sliding_audio_buffer = np.empty(0, dtype=np.float32)
+        self._last_sliding_text = ""
         self.ui.set_text("")
         self.ui.set_status("貼り付け完了")
 
@@ -474,6 +616,9 @@ class VoiceInputApp:
         self._buffer_generation += 1
         self._drain_stt_queues()
         self._session_audio_chunks = []
+        with self._sliding_audio_lock:
+            self._sliding_audio_buffer = np.empty(0, dtype=np.float32)
+        self._last_sliding_text = ""
 
         try:
             self.transcriber = self._build_transcriber(next_primary_model_id, next_backend)
@@ -497,20 +642,23 @@ class VoiceInputApp:
                 break
 
     def clear_recording_buffer(self) -> None:
-        if not self._recording:
-            self.ui.set_status("録音中のみバッファクリアできます")
-            return
-
         self._buffer_generation += 1
         self._drain_stt_queues()
         while self.recorder.pop_chunk_nowait() is not None:
             pass
         self._session_audio_chunks = []
+        with self._sliding_audio_lock:
+            self._sliding_audio_buffer = np.empty(0, dtype=np.float32)
+        self._last_sliding_text = ""
 
         with self._text_lock:
             self._current_text = ""
+            self._confirmed_text = ""
         self.ui.set_text("")
-        self.ui.set_status("録音中...（バッファクリア）")
+        if self._recording:
+            self.ui.set_status("録音中...（バッファクリア）")
+        else:
+            self.ui.set_status("待機中（バッファクリア）")
 
     def _on_close(self) -> None:
         self.hotkeys.unregister()

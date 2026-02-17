@@ -31,10 +31,12 @@ class AppConfig:
     sherpa_onnx_model_dir: Path = Path(os.getenv("SHERPA_ONNX_MODEL_DIR", ".models/reazonspeech-v2-sherpa-onnx"))
     sherpa_onnx_model_type: str = os.getenv("SHERPA_ONNX_MODEL_TYPE", "paraformer")
     model_cache_dir: Path = Path(os.getenv("MODEL_CACHE_DIR", ".models"))
-    sample_rate: int = int(os.getenv("SAMPLE_RATE", "48000"))
+    sample_rate: int = int(os.getenv("SAMPLE_RATE", "16000"))
     channels: int = int(os.getenv("CHANNELS", "1"))
     audio_blocksize: int = int(os.getenv("AUDIO_BLOCKSIZE", "1024"))
     audio_chunk_seconds: float = float(os.getenv("AUDIO_CHUNK_SECONDS", "0.6"))
+    audio_max_chunk_latency_seconds: float = float(os.getenv("AUDIO_MAX_CHUNK_LATENCY_SECONDS", "0.6"))
+    ui_pump_interval_ms: int = int(os.getenv("UI_PUMP_INTERVAL_MS", "80"))
     stt_input_queue_max: int = int(os.getenv("STT_INPUT_QUEUE_MAX", "0"))
     realtime_context_chars: int = int(os.getenv("REALTIME_CONTEXT_CHARS", "80"))
     realtime_max_chars_per_second: float = float(os.getenv("REALTIME_MAX_CHARS_PER_SECOND", "14"))
@@ -57,4 +59,16 @@ class AppConfig:
     confirm_hotkey: str = os.getenv("CONFIRM_HOTKEY", "enter")
     switch_model_hotkey: str = os.getenv("SWITCH_MODEL_HOTKEY", "ctrl+alt+m")
     clear_buffer_hotkey: str = os.getenv("CLEAR_BUFFER_HOTKEY", "esc")
+    realtime_model_id: str = os.getenv("REALTIME_MODEL_ID", "")
+    sliding_window_seconds: float = float(os.getenv("SLIDING_WINDOW_SECONDS", "3.0"))
+    sliding_window_step_seconds: float = float(os.getenv("SLIDING_WINDOW_STEP_SECONDS", "0.6"))
+    hallucination_repetition_threshold: int = int(os.getenv("HALLUCINATION_REPETITION_THRESHOLD", "2"))
+    hallucination_blacklist: tuple[str, ...] = tuple(
+        item.strip()
+        for item in os.getenv(
+            "HALLUCINATION_BLACKLIST",
+            "ご清聴ありがとうございました,ありがとうございました,チャンネル登録,お願いします,字幕,おやすみなさい,ではまた",
+        ).split(",")
+        if item.strip()
+    )
     preview_window_title: str = os.getenv("PREVIEW_WINDOW_TITLE", "KoeFlow preview")
