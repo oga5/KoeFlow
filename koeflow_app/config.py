@@ -56,19 +56,30 @@ class AppConfig:
     mic_monitor_log_interval_seconds: float = float(os.getenv("MIC_MONITOR_LOG_INTERVAL_SECONDS", "2.0"))
     mic_monitor_rms_threshold: float = float(os.getenv("MIC_MONITOR_RMS_THRESHOLD", "0.008"))
     toggle_hotkey: str = os.getenv("TOGGLE_HOTKEY", "ctrl+alt+v")
-    confirm_hotkey: str = os.getenv("CONFIRM_HOTKEY", "enter")
+    confirm_hotkey: str = os.getenv("CONFIRM_HOTKEY", "ctrl+alt+p")
     switch_model_hotkey: str = os.getenv("SWITCH_MODEL_HOTKEY", "ctrl+alt+m")
     clear_buffer_hotkey: str = os.getenv("CLEAR_BUFFER_HOTKEY", "esc")
     realtime_model_id: str = os.getenv("REALTIME_MODEL_ID", "")
-    sliding_window_seconds: float = float(os.getenv("SLIDING_WINDOW_SECONDS", "3.0"))
-    sliding_window_step_seconds: float = float(os.getenv("SLIDING_WINDOW_STEP_SECONDS", "0.6"))
+    vad_silence_rms: float = float(os.getenv("VAD_SILENCE_RMS", "0.008"))
+    vad_silence_seconds: float = float(os.getenv("VAD_SILENCE_SECONDS", "0.8"))
+    vad_max_segment_seconds: float = float(os.getenv("VAD_MAX_SEGMENT_SECONDS", "15.0"))
     hallucination_repetition_threshold: int = int(os.getenv("HALLUCINATION_REPETITION_THRESHOLD", "2"))
     hallucination_blacklist: tuple[str, ...] = tuple(
         item.strip()
         for item in os.getenv(
             "HALLUCINATION_BLACKLIST",
-            "ご清聴ありがとうございました,ありがとうございました,チャンネル登録,お願いします,字幕,おやすみなさい,ではまた",
+            "ご清聴ありがとうございました,ありがとうございました,チャンネル登録,お願いします,字幕,おやすみなさい,ではまた,あの,えーと,えっと,うーん,うん,ええ,まあ,あのー,えー,そのー",
         ).split(",")
+        if item.strip()
+    )
+    voice_cmd_paste: tuple[str, ...] = tuple(
+        item.strip()
+        for item in os.getenv("VOICE_CMD_PASTE", "貼り付け,はりつけ,ペースト").split(",")
+        if item.strip()
+    )
+    voice_cmd_clear: tuple[str, ...] = tuple(
+        item.strip()
+        for item in os.getenv("VOICE_CMD_CLEAR", "クリア,取り消し,やり直し").split(",")
         if item.strip()
     )
     preview_window_title: str = os.getenv("PREVIEW_WINDOW_TITLE", "KoeFlow preview")

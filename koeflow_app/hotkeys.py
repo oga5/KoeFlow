@@ -29,12 +29,20 @@ class HotkeyManager:
         self._clear_buffer_handle = None
 
     def register(self) -> None:
-        self._toggle_handle = keyboard.add_hotkey(self.toggle_hotkey, self._on_toggle)
-        self._confirm_handle = keyboard.add_hotkey(self.confirm_hotkey, self._on_confirm)
+        self._toggle_handle = keyboard.add_hotkey(
+            self.toggle_hotkey, self._on_toggle, suppress=True, trigger_on_release=True,
+        )
+        self._confirm_handle = keyboard.add_hotkey(
+            self.confirm_hotkey, self._on_confirm, suppress=True, trigger_on_release=True,
+        )
         if self.switch_model_hotkey and self._on_switch_model is not None:
-            self._switch_model_handle = keyboard.add_hotkey(self.switch_model_hotkey, self._on_switch_model)
+            self._switch_model_handle = keyboard.add_hotkey(
+                self.switch_model_hotkey, self._on_switch_model, suppress=True, trigger_on_release=True,
+            )
         if self.clear_buffer_hotkey and self._on_clear_buffer is not None:
-            self._clear_buffer_handle = keyboard.add_hotkey(self.clear_buffer_hotkey, self._on_clear_buffer)
+            self._clear_buffer_handle = keyboard.add_hotkey(
+                self.clear_buffer_hotkey, self._on_clear_buffer, suppress=True, trigger_on_release=True,
+            )
 
     def unregister(self) -> None:
         if self._toggle_handle is not None:
