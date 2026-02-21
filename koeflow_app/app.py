@@ -259,13 +259,9 @@ class VoiceInputApp:
             self._stop_recording()
 
     def _on_confirm_hotkey(self) -> None:
-        if not self.ui.is_active:
-            return
         self.confirm_and_paste()
 
     def _on_clear_buffer_hotkey(self) -> None:
-        if not self.ui.is_active:
-            return
         self.clear_recording_buffer()
 
     def _on_switch_model_hotkey(self) -> None:

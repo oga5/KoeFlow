@@ -1,6 +1,25 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import keyboard
+
+
+def _release_then_call(hotkey_str: str, callback) -> None:  # noqa: ANN001
+    """Wait until all keys in the hotkey combo are released, then invoke callback."""
+    parts = keyboard.parse_hotkey(hotkey_str)
+    scan_codes: set[int] = set()
+    for step in parts:
+        for codes in step:
+            scan_codes.update(codes)
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not any(keyboard.is_pressed(sc) for sc in scan_codes):
+            break
+        time.sleep(0.02)
+    callback()
 
 
 class HotkeyManager:
@@ -28,20 +47,28 @@ class HotkeyManager:
         self._switch_model_handle = None
         self._clear_buffer_handle = None
 
+    @staticmethod
+    def _wrap(hotkey_str: str, callback) -> callable:  # noqa: ANN001
+        def _handler() -> None:
+            threading.Thread(
+                target=_release_then_call, args=(hotkey_str, callback), daemon=True,
+            ).start()
+        return _handler
+
     def register(self) -> None:
         self._toggle_handle = keyboard.add_hotkey(
-            self.toggle_hotkey, self._on_toggle, suppress=True, trigger_on_release=True,
+            self.toggle_hotkey, self._wrap(self.toggle_hotkey, self._on_toggle),
         )
         self._confirm_handle = keyboard.add_hotkey(
-            self.confirm_hotkey, self._on_confirm, suppress=True, trigger_on_release=True,
+            self.confirm_hotkey, self._wrap(self.confirm_hotkey, self._on_confirm),
         )
         if self.switch_model_hotkey and self._on_switch_model is not None:
             self._switch_model_handle = keyboard.add_hotkey(
-                self.switch_model_hotkey, self._on_switch_model, suppress=True, trigger_on_release=True,
+                self.switch_model_hotkey, self._wrap(self.switch_model_hotkey, self._on_switch_model),
             )
         if self.clear_buffer_hotkey and self._on_clear_buffer is not None:
             self._clear_buffer_handle = keyboard.add_hotkey(
-                self.clear_buffer_hotkey, self._on_clear_buffer, suppress=True, trigger_on_release=True,
+                self.clear_buffer_hotkey, self._wrap(self.clear_buffer_hotkey, self._on_clear_buffer),
             )
 
     def unregister(self) -> None:

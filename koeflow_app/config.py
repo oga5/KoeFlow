@@ -27,7 +27,7 @@ class AppConfig:
     primary_model_id: str = os.getenv("PRIMARY_MODEL_ID", "Systran/faster-whisper-medium")
     model_presets: tuple[str, ...] = _parse_model_presets(primary_model_id)
     fallback_model_id: str = os.getenv("FALLBACK_MODEL_ID", "Systran/faster-whisper-medium")
-    transcriber_backend: str = os.getenv("TRANSCRIBER_BACKEND", "faster-whisper")
+    transcriber_backend: str = os.getenv("TRANSCRIBER_BACKEND", "sherpa-onnx")
     sherpa_onnx_model_dir: Path = Path(os.getenv("SHERPA_ONNX_MODEL_DIR", ".models/reazonspeech-v2-sherpa-onnx"))
     sherpa_onnx_model_type: str = os.getenv("SHERPA_ONNX_MODEL_TYPE", "paraformer")
     model_cache_dir: Path = Path(os.getenv("MODEL_CACHE_DIR", ".models"))
